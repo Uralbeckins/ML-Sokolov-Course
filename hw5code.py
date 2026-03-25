@@ -1,5 +1,8 @@
 import numpy as np
 from collections import Counter
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.linear_model import LinearRegression
 
 
 def find_best_split(feature_vector, target_vector):
@@ -21,12 +24,15 @@ def find_best_split(feature_vector, target_vector):
 
         tresholds_list.append(np.mean([feature_vector[i], feature_vector[i+1]]))
 
-        p_r = cum_sum[i] / (i+1)
-        p_l = (cum_sum[-1] - cum_sum[i]) / (length - i - 1)
+        # Левая часть: индексы 0..i (всего i+1 элементов)
+        p_left = cum_sum[i] / (i+1)
+        # Правая часть: индексы i+1..length-1 (всего length-i-1 элементов)
+        p_right = (cum_sum[-1] - cum_sum[i]) / (length - i - 1)
 
-        H_r = 1 - p_r ** 2 - (1 - p_r) ** 2
-        H_l = 1 - p_l ** 2 - (1 - p_l) ** 2
-        ginies_list.append(-(length-i-1) / length * H_l - (i+1) / length * H_r)
+        H_left = 1 - p_left ** 2 - (1 - p_left) ** 2
+        H_right = 1 - p_right ** 2 - (1 - p_right) ** 2
+        gini = -((i+1) / length) * H_left - ((length - i - 1) / length) * H_right
+        ginies_list.append(gini)
 
     if not ginies_list:
         return None, None, None, None
@@ -36,18 +42,26 @@ def find_best_split(feature_vector, target_vector):
 
 
 class DecisionTree:
-    def __init__(self, feature_types, max_depth=1, min_samples_split=10, min_samples_leaf=1):
+    def __init__(self, feature_types, max_depth=5, min_samples_split=10, min_samples_leaf=2):
         if np.any(list(map(lambda x: x != "num" and x != "cat", feature_types))):
             raise ValueError("There is unknown feature type")
 
         self._tree = {}
-        self._depth = 0
+        self._max_reached_depth = 0
         self._feature_types = feature_types
         self._max_depth = max_depth
         self._min_samples_split = min_samples_split
         self._min_samples_leaf = min_samples_leaf
 
     def _fit_node(self, sub_X, sub_y, node, depth):
+
+        self._max_reached_depth = max(self._max_reached_depth, depth)
+        # Преобразуем в DataFrame, если это необходимо
+        if not isinstance(sub_X, pd.DataFrame):
+            sub_X = pd.DataFrame(sub_X)
+        
+        sub_y = np.array(sub_y)
+        
         if np.all(sub_y == sub_y[0]):
             node["type"] = "terminal"
             node["class"] = sub_y[0]
@@ -57,15 +71,11 @@ class DecisionTree:
             node['type'] = 'terminal'
             node['class'] = Counter(sub_y).most_common(1)[0][0]
             return
-        
-        self._depth += 1
 
-        feature_best, threshold_best, gini_best, split = None, None, None, None
-        for feature in range(0, sub_X.shape[1]):
-            
+        feature_best, threshold_best, gini_best, best_split = None, None, None, None
+        for feature in range(sub_X.shape[1]):
             feature_type = self._feature_types[feature]
-            categories_map = {}
-            best_split = None
+            current_split = None
 
             if feature_type == "num":
                 feature_vector = np.array(sub_X.iloc[:, feature])
@@ -90,130 +100,274 @@ class DecisionTree:
             if threshold is None:
                 continue
 
-            split = feature_vector < threshold
-            if np.sum(split) <= self._min_samples_leaf or np.sum(np.logical_not(split)) <= self._min_samples_leaf:
-                    continue
+            # Создаем булев массив для разделения
+            current_split = feature_vector < threshold
+                
+            # Проверяем min_samples_leaf
+            if np.sum(current_split) < self._min_samples_leaf or np.sum(~current_split) < self._min_samples_leaf:
+                continue
             
-            if gini_best is None or gini < gini_best:
+            # Выбираем лучший сплит (максимум Gini)
+            if gini_best is None or gini > gini_best:
                 feature_best = feature
                 gini_best = gini
-                
-                if feature_type == "num":
-                    threshold_best = threshold
-                elif feature_type == "cat":
-                    threshold_best = list(map(lambda x: x[0], filter(lambda x: x[1] < threshold, categories_map.items())))
-                else:
-                    raise ValueError
-                
+                threshold_best = threshold
+                best_split = current_split
 
-
-        if feature_best is None:
+        if feature_best is None or best_split is None:
             node["type"] = "terminal"
             node["class"] = Counter(sub_y).most_common(1)[0][0]
             return
 
         node["type"] = "nonterminal"
         node["feature_split"] = feature_best
+        
         if self._feature_types[feature_best] == "num":
             node["threshold"] = threshold_best
         elif self._feature_types[feature_best] == "cat":
-            node["categories_split"] = threshold_best
+            # Для категориальных признаков сохраняем список категорий, которые идут влево
+            categories_left = []
+            feature_values = sub_X.iloc[:, feature_best]
+            for i in range(len(feature_values)):
+                if best_split[i]:
+                    categories_left.append(feature_values.iloc[i])
+            # Убираем дубликаты
+            node["categories_split"] = list(set(categories_left))
         else:
             raise ValueError
+        
         node["left_child"], node["right_child"] = {}, {}
-        self._fit_node(sub_X[best_split], sub_y[best_split], node["left_child"], depth+1)
-        self._fit_node(sub_X[np.logical_not(best_split)], sub_y[np.logical_not(best_split)], node["right_child"], depth+1)
+        
+        # Рекурсивно строим левое и правое поддеревья
+        left_indices = np.where(best_split)[0]
+        right_indices = np.where(~best_split)[0]
+        
+        self._fit_node(sub_X.iloc[left_indices], sub_y[left_indices], node["left_child"], depth + 1)
+        self._fit_node(sub_X.iloc[right_indices], sub_y[right_indices], node["right_child"], depth + 1)
+
 
     def _predict_node(self, x, node):
-        # ╰( ͡° ͜ʖ ͡° )つ──☆*:・ﾟ
-        pass
+        if node["type"] == "terminal":
+            return node["class"]
+        
+        # Проверяем, что feature_split существует и не равен None
+        if "feature_split" not in node or node["feature_split"] is None:
+            return node.get("class", 0)  # Возвращаем класс по умолчанию, если есть
+        
+        feature = node["feature_split"]
+        feature_type = self._feature_types[feature]
+
+        if feature_type == "num":
+            if "threshold" not in node:
+                return node.get("class", 0)
+            if x.iloc[feature] < node["threshold"]:
+                return self._predict_node(x, node["left_child"])
+            else:
+                return self._predict_node(x, node["right_child"])
+
+        elif feature_type == "cat":
+            if "categories_split" not in node:
+                return node.get("class", 0)
+            if x.iloc[feature] in node["categories_split"]:
+                return self._predict_node(x, node["left_child"])
+            else:
+                return self._predict_node(x, node["right_child"])
+        else:
+            return node.get("class", 0)
 
     def fit(self, X, y):
+        # Преобразуем X в DataFrame, если это необходимо
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        self._max_reached_depth = 0
         self._fit_node(X, y, self._tree, depth=0)
+        return self
 
     def predict(self, X):
+        # Преобразуем X в DataFrame, если это необходимо
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        
         predicted = []
-        for x in X:
+        for i in range(X.shape[0]):
+            x = X.iloc[i]
             predicted.append(self._predict_node(x, self._tree))
         return np.array(predicted)
 
+
+def find_best_split_mod(f_v, t_v, base_model=LinearRegression()):
+    f_v = np.array(f_v)
+    t_v = np.array(t_v)
+
+    idx_sorted = np.argsort(f_v)
+    f_v = f_v[idx_sorted]
+    t_v = t_v[idx_sorted]
+    tresholds_list = []
+    losses_list = []
+    length = len(f_v)
+
+    for i in range(length-1):
+
+        if f_v[i] == f_v[i+1]:
+            continue
+
+        tresholds_list.append(np.mean([f_v[i], f_v[i+1]]))
+
+        r_l, t_l = f_v[i+1:], t_v[i+1:]
+        r_r, t_r = f_v[:i+1], t_v[:i+1]
+
+        model_left = base_model.fit(r_l.reshape(-1, 1), t_l)
+        model_right = base_model.fit(r_r.reshape(-1, 1), t_r)
+
+        loss_left = mean_squared_error(t_l, model_left.predict(r_l.reshape(-1, 1)))
+        loss_right = mean_squared_error(t_r, model_right.predict(r_r.reshape(-1, 1)))
+
+        losses_list.append((len(t_l) * loss_left + len(t_r) * loss_right) / length)
+
+    
+    if not losses_list:
+        return None, None, None, None
+    best_idx = np.argmin(losses_list)
+
+    return tresholds_list, losses_list, tresholds_list[best_idx], losses_list[best_idx]
+
 class LinearRegressionTree():
-    def __init__(self, feature_types, base_model_type=None, max_depth=None, min_samples_split=None, min_samples_leaf=None):
-        pass
+    def __init__(self, feature_types, base_model_type, max_depth=5, min_samples_split=10, min_samples_leaf=2):
+        if np.any(list(map(lambda x: x != "num" and x != "cat", feature_types))):
+            raise ValueError("There is unknown feature type")
+
+        self._tree = {}
+        self._base_model_type = base_model_type
+        self._max_reached_depth = 0
+        self._feature_types = feature_types
+        self._max_depth = max_depth
+        self._min_samples_split = min_samples_split
+        self._min_samples_leaf = min_samples_leaf
+
+    def _fit_node(self, sub_X, sub_y, node, depth):
+
+        self._max_reached_depth = max(self._max_reached_depth, depth)
+        # Преобразуем в DataFrame, если это необходимо
+        if not isinstance(sub_X, pd.DataFrame):
+            sub_X = pd.DataFrame(sub_X)
+        
+        sub_y = np.array(sub_y)
+        
+        if np.all(sub_y == sub_y[0]):
+            node["type"] = "terminal"
+            node["class"] = sub_y[0]
+            return
+        
+        if len(sub_y) < self._min_samples_split or depth >= self._max_depth:
+            node['type'] = 'terminal'
+            node['class'] = Counter(sub_y).most_common(1)[0][0]
+            return
+
+        feature_best, threshold_best, gini_best, best_split = None, None, None, None
+        for feature in range(sub_X.shape[1]):
+            feature_type = self._feature_types[feature]
+            current_split = None
+
+            if feature_type == "num":
+                feature_vector = np.array(sub_X.iloc[:, feature])
+            else:
+                raise ValueError
+
+            _, _, threshold, gini = find_best_split(feature_vector, sub_y)
+            
+            if threshold is None:
+                continue
+
+            # Создаем булев массив для разделения
+            current_split = feature_vector < threshold
+                
+            # Проверяем min_samples_leaf
+            if np.sum(current_split) < self._min_samples_leaf or np.sum(~current_split) < self._min_samples_leaf:
+                continue
+            
+            # Выбираем лучший сплит (максимум Gini)
+            if gini_best is None or gini > gini_best:
+                feature_best = feature
+                gini_best = gini
+                threshold_best = threshold
+                best_split = current_split
+
+        if feature_best is None or best_split is None:
+            node["type"] = "terminal"
+            node["class"] = Counter(sub_y).most_common(1)[0][0]
+            return
+
+        node["type"] = "nonterminal"
+        node["feature_split"] = feature_best
+        
+        if self._feature_types[feature_best] == "num":
+            node["threshold"] = threshold_best
+        elif self._feature_types[feature_best] == "cat":
+            # Для категориальных признаков сохраняем список категорий, которые идут влево
+            categories_left = []
+            feature_values = sub_X.iloc[:, feature_best]
+            for i in range(len(feature_values)):
+                if best_split[i]:
+                    categories_left.append(feature_values.iloc[i])
+            # Убираем дубликаты
+            node["categories_split"] = list(set(categories_left))
+        else:
+            raise ValueError
+        
+        node["left_child"], node["right_child"] = {}, {}
+        
+        # Рекурсивно строим левое и правое поддеревья
+        left_indices = np.where(best_split)[0]
+        right_indices = np.where(~best_split)[0]
+        
+        self._fit_node(sub_X.iloc[left_indices], sub_y[left_indices], node["left_child"], depth + 1)
+        self._fit_node(sub_X.iloc[right_indices], sub_y[right_indices], node["right_child"], depth + 1)
 
 
-# class DecisionTree:
-#     def __init__(self, feature_types, max_depth=None, min_samples_split=None, min_samples_leaf=None):
-#         if np.any(list(map(lambda x: x != "real" and x != "categorical", feature_types))):
-#             raise ValueError("There is unknown feature type")
+    def _predict_node(self, x, node):
+        if node["type"] == "terminal":
+            return node["class"]
+        
+        # Проверяем, что feature_split существует и не равен None
+        if "feature_split" not in node or node["feature_split"] is None:
+            return node.get("class", 0)  # Возвращаем класс по умолчанию, если есть
+        
+        feature = node["feature_split"]
+        feature_type = self._feature_types[feature]
 
-#         self._tree = {}
-#         self._feature_types = feature_types
-#         self._max_depth = max_depth
-#         self._min_samples_split = min_samples_split
-#         self._min_samples_leaf = min_samples_leaf
+        if feature_type == "num":
+            if "threshold" not in node:
+                return node.get("class", 0)
+            if x.iloc[feature] < node["threshold"]:
+                return self._predict_node(x, node["left_child"])
+            else:
+                return self._predict_node(x, node["right_child"])
 
-#     def _fit_node(self, sub_X, sub_y, node):
-#         if np.all(sub_y != sub_y[0]):
-#             node["type"] = "terminal"
-#             node["class"] = sub_y[0]
-#             return
+        elif feature_type == "cat":
+            if "categories_split" not in node:
+                return node.get("class", 0)
+            if x.iloc[feature] in node["categories_split"]:
+                return self._predict_node(x, node["left_child"])
+            else:
+                return self._predict_node(x, node["right_child"])
+        else:
+            return node.get("class", 0)
 
-#         feature_best, threshold_best, gini_best, split = None, None, None, None
-#         for feature in range(1, sub_X.shape[1]):
-#             feature_type = self._feature_types[feature]
-#             categories_map = {}
+    def fit(self, X, y):
+        # Преобразуем X в DataFrame, если это необходимо
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        self._max_reached_depth = 0
+        self._fit_node(X, y, self._tree, depth=0)
+        return self
 
-#             if feature_type == "real":
-#                 feature_vector = sub_X[:, feature]
-#             elif feature_type == "categorical":
-#                 counts = Counter(sub_X[:, feature])
-#                 clicks = Counter(sub_X[sub_y == 1, feature])
-#                 ratio = {}
-#                 for key, current_count in counts.items():
-#                     if key in clicks:
-#                         current_click = clicks[key]
-#                     else:
-#                         current_click = 0
-#                     ratio[key] = current_count / current_click
-#                 sorted_categories = list(map(lambda x: x[1], sorted(ratio.items(), key=lambda x: x[1])))
-#                 categories_map = dict(zip(sorted_categories, list(range(len(sorted_categories)))))
-
-#                 feature_vector = np.array(map(lambda x: categories_map[x], sub_X[:, feature]))
-#             else:
-#                 raise ValueError
-
-#             if len(feature_vector) == 3:
-#                 continue
-
-#             _, _, threshold, gini = find_best_split(feature_vector, sub_y)
-#             if gini_best is None or gini > gini_best:
-#                 feature_best = feature
-#                 gini_best = gini
-#                 split = feature_vector < threshold
-
-#                 if feature_type == "real":
-#                     threshold_best = threshold
-#                 elif feature_type == "Categorical":
-#                     threshold_best = list(map(lambda x: x[0],
-#                                               filter(lambda x: x[1] < threshold, categories_map.items())))
-#                 else:
-#                     raise ValueError
-
-#         if feature_best is None:
-#             node["type"] = "terminal"
-#             node["class"] = Counter(sub_y).most_common(1)
-#             return
-
-#         node["type"] = "nonterminal"
-
-#         node["feature_split"] = feature_best
-#         if self._feature_types[feature_best] == "real":
-#             node["threshold"] = threshold_best
-#         elif self._feature_types[feature_best] == "categorical":
-#             node["categories_split"] = threshold_best
-#         else:
-#             raise ValueError
-#         node["left_child"], node["right_child"] = {}, {}
-#         self._fit_node(sub_X[split], sub_y[split], node["left_child"])
-#         self._fit_node(sub_X[np.logical_not(split)], sub_y[split], node["right_child"])
+    def predict(self, X):
+        # Преобразуем X в DataFrame, если это необходимо
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        
+        predicted = []
+        for i in range(X.shape[0]):
+            x = X.iloc[i]
+            predicted.append(self._predict_node(x, self._tree))
+        return np.array(predicted)
